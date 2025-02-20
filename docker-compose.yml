@@ -1,0 +1,73 @@
+services:
+  krikri_trt:
+    build:
+      context: .
+      dockerfile: Dockerfile.krikri_trt  
+    container_name: trt2501_krikri
+    command: >
+      tritonserver --model-repository=/krikri/ 
+      --model-control-mode=explicit 
+      --load-model=preprocessing 
+      --load-model=postprocessing 
+      --load-model=ensemble 
+      --http-port=8000 
+      --grpc-port=8001
+      --metrics-port=8002
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+      - "8002:8002"
+    volumes:
+      - /mnt/nvme512/engines:/engines
+      - /home/chris/krikri/krikri/:/krikri
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      NVIDIA_VISIBLE_DEVICES: 0
+    runtime: nvidia
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      stack: 67108864
+    security_opt:
+      - label=disable
+      - seccomp=unconfined
+    tmpfs:
+      - /tmp:exec
+    user: root
+    ipc: host
+
+
+  backend_api:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.backend
+    container_name: fastapi_backend
+    command: gunicorn -k uvicorn.workers.UvicornWorker grpc_websocket:app --bind 0.0.0.0:7000 --workers 4
+    ports:
+      - "7000:7000"
+    volumes:
+      - ./:/app
+      - /mnt/nvme512/engines:/engines
+    depends_on:
+       - krikri_trt
+    environment:
+      - TRITON_SERVER_URL_4060=krikri_trt:8001
+    privileged: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  next_app:
+    build:
+      context: ./chatbot-ui
+      dockerfile: ../Dockerfile.next
+    container_name: next_app
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./chatbot-ui:/app
+
+
+networks:
+  custom_net:
+    driver: bridge

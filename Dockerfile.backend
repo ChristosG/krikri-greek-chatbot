@@ -1,0 +1,38 @@
+FROM python:3.10-slim
+
+
+  
+
+
+RUN apt-get update && apt-get install -y \
+    gcc \
+    python3-dev \
+    libffi-dev \
+    gunicorn \
+    build-essential
+
+RUN pip install --upgrade pip && pip install numpy torch transformers langchain pydantic requests 
+
+RUN pip install   scipy \
+    uvicorn \
+    fastapi 
+
+RUN pip install tritonclient[all]
+
+RUN pip install websockets
+
+RUN pip install "uvicorn[all]"
+
+RUN pip install gunicorn
+
+RUN apt-get update && apt-get install -y uvicorn
+
+WORKDIR /app
+
+COPY . /app
+
+
+EXPOSE 7000
+
+
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "grpc_websocket:app", "--host", "0.0.0.0", "--port", "7000", "--workers", "4"]

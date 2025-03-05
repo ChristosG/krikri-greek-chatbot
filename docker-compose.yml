@@ -43,7 +43,7 @@ services:
       context: .
       dockerfile: ./Dockerfile.backend
     container_name: fastapi_backend
-    command: gunicorn -k uvicorn.workers.UvicornWorker grpc_websocket:app --bind 0.0.0.0:7000 --workers 4
+    command: gunicorn -k uvicorn.workers.UvicornWorker grpc_websocket:app --bind 0.0.0.0:7000 --workers 4 --reload
     ports:
       - "7000:7000"
     volumes:

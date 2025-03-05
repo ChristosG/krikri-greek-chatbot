@@ -1,4 +1,3 @@
-// app/page.tsx
 "use client";
 
 import { useState, useEffect, useRef } from "react";
@@ -39,14 +38,17 @@ export default function ChatPage() {
   const [isConnected, setIsConnected] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
+  // New state to track if a message is being generated
+  const [isGenerating, setIsGenerating] = useState(false);
 
+  // Persistent WebSocket reference.
   const wsRef = useRef<WebSocket | null>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const pendingBotMessageRef = useRef<string>("");
   const updateScheduledRef = useRef<boolean>(false);
-  const userInterruptedScroll = useRef<boolean>(false); // Track if user manually scrolled
-
-  
+  const userInterruptedScroll = useRef<boolean>(false);
+  // Ref to hold generation timeout ID
+  const generationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const toggleTheme = () => {
     setTheme(theme === "dark" ? "light" : "dark");
@@ -93,9 +95,7 @@ export default function ChatPage() {
     },
   ];
 
-  // Track which profile is active
   const [selectedProfileIndex, setSelectedProfileIndex] = useState(0);
-
 
   const switchToProfile = (index: number) => {
     const p = profiles[index];
@@ -109,98 +109,39 @@ export default function ChatPage() {
     setSelectedProfileIndex(index);
   };
 
-  // Optionally, on first render, load Profile 0 (Custom 1):
   useEffect(() => {
     switchToProfile(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-
+  // Establish a persistent WebSocket connection when the component mounts.
   useEffect(() => {
-    // Function to check if the user is near the bottom.  More robust than exact bottom.
-    const isNearBottom = () => {
-      if (!chatContainerRef.current) return true; // Default to true if no ref
-      const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
-      return scrollHeight - scrollTop <= clientHeight + 100; // 100px threshold
-    };
-
-    const checkAutoScroll = () => {
-      if (!chatContainerRef.current) return;
-
-      if (userInterruptedScroll.current) {
-          // If the user has scrolled, and they *aren't* near the bottom, keep autoScroll disabled.
-          if (!isNearBottom()) {
-            return;
-          }
-        // If we are close to the bottom, reenable auto-scroll.
-          setAutoScroll(true);
-          userInterruptedScroll.current = false; // Important: Reset the flag.
-      }
-
-
-        if (autoScroll) {
-          chatContainerRef.current.scrollTo({ top: chatContainerRef.current.scrollHeight, behavior: "smooth" });
-        }
-
+    const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+    let wsPort = "";
+    if (window.location.hostname === "localhost") {
+      wsPort = ":7000";
     }
-      // Only call if refs exist.
-      if (pendingBotMessageRef.current && chatContainerRef.current){
-        checkAutoScroll();
-      }
-  }, [conversations, autoScroll]); // Depend on conversations and autoScroll
-
-  const toggleSettings = () => {
-    setShowSettings((prev) => !prev);
-  };
-
-  const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    if (!prompt.trim()) return;
-
-    setConversations((prev) => [
-      ...prev,
-      { role: "user", content: prompt },
-      { role: "bot", content: "" },
-    ]);
-    pendingBotMessageRef.current = "";
-    userInterruptedScroll.current = false; // Reset on new submission
-    setAutoScroll(true); // Re-enable autoScroll on new submission
-
-    const payload = {
-      prompt,
-      max_tokens: maxTokens,
-      temperature,
-      top_k: topK,
-      top_p: topP,
-      repetition_penalty: repetitionPenalty,
-      frequency_penalty: frequencyPenalty,
-      presence_penalty: presencePenalty,
-    };
-
-    //const ws = new WebSocket("ws://localhost:7000/ws");//("wss://zelime.duckdns.org/ws");
-    
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    let wsPort = '';
-    
-    // Use port 7000 only when running on localhost (development)
-    if (window.location.hostname === 'localhost') {
-      wsPort = ':7000';
-    }
-    
     const ws = new WebSocket(`${wsProtocol}://${window.location.hostname}${wsPort}/ws`);
-    
-
-    
     wsRef.current = ws;
 
     ws.onopen = () => {
       setIsConnected(true);
-      ws.send(JSON.stringify(payload));
+      console.log("WebSocket connection opened");
     };
 
     ws.onmessage = (event) => {
       const token = event.data;
       pendingBotMessageRef.current = mergeToken(pendingBotMessageRef.current, token);
+
+      // Every time a token arrives, clear and reset the generation timeout.
+      if (generationTimeoutRef.current) {
+        clearTimeout(generationTimeoutRef.current);
+      }
+      setIsGenerating(true);
+      generationTimeoutRef.current = setTimeout(() => {
+        setIsGenerating(false);
+        generationTimeoutRef.current = null;
+      }, 500);
 
       if (!updateScheduledRef.current) {
         updateScheduledRef.current = true;
@@ -220,6 +161,7 @@ export default function ChatPage() {
 
     ws.onclose = () => {
       setIsConnected(false);
+      console.log("WebSocket connection closed");
     };
 
     ws.onerror = (error) => {
@@ -227,26 +169,65 @@ export default function ChatPage() {
       setIsConnected(false);
     };
 
+    return () => {
+      ws.close();
+    };
+  }, []);
+
+  const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!prompt.trim()) return;
+
+    // Update conversation history locally.
+    setConversations((prev) => [
+      ...prev,
+      { role: "user", content: prompt },
+      { role: "bot", content: "" },
+    ]);
+    pendingBotMessageRef.current = "";
+    userInterruptedScroll.current = false;
+    setAutoScroll(true);
+
+    // Set generation to true at the start of a new message.
+    setIsGenerating(true);
+
+    const payload = {
+      prompt,
+      max_tokens: maxTokens,
+      temperature,
+      top_k: topK,
+      top_p: topP,
+      repetition_penalty: repetitionPenalty,
+      frequency_penalty: frequencyPenalty,
+      presence_penalty: presencePenalty,
+    };
+
+    // Use the persistent WebSocket connection.
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(payload));
+    } else {
+      console.error("WebSocket connection is not open.");
+    }
+
     setPrompt("");
   };
 
-
   const handleScroll = () => {
     if (!chatContainerRef.current) return;
-
     const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
-    const isAtBottom = scrollHeight - scrollTop <= clientHeight + 5;  // Small buffer
-
+    const isAtBottom = scrollHeight - scrollTop <= clientHeight + 5;
     if (!isAtBottom) {
       setAutoScroll(false);
-      userInterruptedScroll.current = true; // Set the flag when user scrolls up
+      userInterruptedScroll.current = true;
     }
   };
 
-
   const scrollToBottom = () => {
     if (chatContainerRef.current) {
-      chatContainerRef.current.scrollTo({ top: chatContainerRef.current.scrollHeight, behavior: "smooth" });
+      chatContainerRef.current.scrollTo({
+        top: chatContainerRef.current.scrollHeight,
+        behavior: "smooth",
+      });
       setAutoScroll(true);
       userInterruptedScroll.current = false;
     }
@@ -258,17 +239,15 @@ export default function ChatPage() {
         theme === "dark" ? "bg-gray-900 text-white" : "bg-gray-100 text-gray-900"
       }`}
     >
-      {/* Navbar with custom profile buttons */}
       <Navbar
         theme={theme}
         toggleTheme={toggleTheme}
-        toggleSettings={toggleSettings}
+        toggleSettings={() => setShowSettings((prev) => !prev)}
         profiles={profiles}
         selectedProfileIndex={selectedProfileIndex}
         onSelectProfile={switchToProfile}
       />
 
-      {/* SettingsPanel in a modal-like overlay */}
       {showSettings && (
         <div className="fixed inset-0 bg-gray-900 bg-opacity-50 z-40 flex items-start justify-center">
           <SettingsPanel
@@ -291,8 +270,11 @@ export default function ChatPage() {
         </div>
       )}
 
-      {/* Main chat area */}
-      <div className="flex-1 overflow-hidden mt-16">
+      <div
+        className="flex-1 overflow-auto mt-16"
+        ref={chatContainerRef}
+        onScroll={handleScroll}
+      >
         <ChatWindow
           conversations={conversations}
           containerRef={chatContainerRef}
@@ -301,13 +283,13 @@ export default function ChatPage() {
         />
       </div>
 
-      {/* Example Input area at bottom */}
       <div className="sticky bottom-0">
+        {/* Pass a combined "isBusy" prop: busy if not connected or if generating */}
         <InputArea
           prompt={prompt}
           setPrompt={setPrompt}
           handleSubmit={handleSubmit}
-          isConnected={isConnected}
+          isBusy={!isConnected || isGenerating}
         />
       </div>
     </div>

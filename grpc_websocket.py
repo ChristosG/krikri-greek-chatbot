@@ -13,10 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import tritonclient.grpc as grpcclient
 from tritonclient.utils import InferenceServerException, np_to_triton_dtype
+from transformers import AutoTokenizer
 
 app = FastAPI()
 
-# Allow CORS so our Next.js frontend can connect
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -32,6 +32,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+TOKENIZER_PATH = '/engines/Llama-Krikri-8B-Instruct/'
+
+try:
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH)
+    print("Tokenizer loaded successfully.")
+except Exception as e:
+    print(f"Failed to load tokenizer: {e}")
+    exit(1)
+
+
 def prepare_tensor(name, input_array):
     t = grpcclient.InferInput(name, input_array.shape, np_to_triton_dtype(input_array.dtype))
     t.set_data_from_numpy(input_array)
@@ -40,20 +50,26 @@ def prepare_tensor(name, input_array):
 class UserData:
     def __init__(self):
         self._completed_requests = queue.Queue()
+        self.conversation_history = [
+            {
+                "role": "system",
+                "content": "Eisai o Mastoras, o prosopikos voithos tou Chris. Help him anywhere you can!"
+            }
+        ]
+        self.response_tokens = []
 
 def ws_callback(user_data, result, error):
     if error:
-        user_data._completed_requests.put(error)
+        user_data._completed_requests.put("Error: " + str(error))
     else:
         token = result.as_numpy('text_output')[0].decode("utf-8")
+        user_data.response_tokens.append(token)
         user_data._completed_requests.put(token)
 
 def blocking_inference(payload, user_data):
     client = grpcclient.InferenceServerClient(url="trt2501_krikri:8001")
     
-    # Extract parameters with defaults:
-    prompt = payload.get("prompt", "")
-    max_tokens_val = payload.get("max_tokens", 1024)
+    max_tokens_val = payload.get("max_tokens", 4196)
     temperature_val = payload.get("temperature", 0.4)
     top_k_val = payload.get("top_k", 40)
     top_p_val = payload.get("top_p", 0.9)
@@ -61,7 +77,8 @@ def blocking_inference(payload, user_data):
     frequency_penalty_val = payload.get("frequency_penalty", 0.0)
     presence_penalty_val = payload.get("presence_penalty", 0.0)
     
-    # Build input arrays
+    prompt = tokenizer.apply_chat_template(user_data.conversation_history, add_generation_prompt=True, tokenize=False)
+    
     text_input = np.array([[prompt]], dtype=object)
     max_tokens = np.ones_like(text_input).astype(np.int32) * int(max_tokens_val)
     stream = np.array([[True]], dtype=bool)
@@ -95,25 +112,32 @@ def blocking_inference(payload, user_data):
 @app.websocket("/ws")
 async def websocket_infer(websocket: WebSocket):
     await websocket.accept()
+    user_data = UserData()
     try:
-        data = await websocket.receive_text()
-        try:
-            payload = json.loads(data)
-        except Exception:
-            payload = {"prompt": data}
-        user_data = UserData()
-        thread = threading.Thread(target=blocking_inference, args=(payload, user_data))
-        thread.start()
-        while thread.is_alive() or not user_data._completed_requests.empty():
+        while True:
+            data = await websocket.receive_text()
             try:
-                token = user_data._completed_requests.get(timeout=0.1)
-                if isinstance(token, InferenceServerException) or isinstance(token, Exception):
-                    await websocket.send_text("Error: " + str(token))
-                else:
-                    await websocket.send_text(token)
-            except queue.Empty:
-                await asyncio.sleep(0.1)
-        await websocket.close()
+                payload = json.loads(data)
+            except Exception:
+                payload = {"prompt": data}
+            user_message = payload.get("prompt", data)
+            user_data.conversation_history.append({"role": "user", "content": user_message})
+            user_data.response_tokens = []
+            
+            thread = threading.Thread(target=blocking_inference, args=(payload, user_data))
+            thread.start()
+            
+            while thread.is_alive() or not user_data._completed_requests.empty():
+                try:
+                    token = user_data._completed_requests.get(timeout=0.1)
+                    if isinstance(token, InferenceServerException) or isinstance(token, Exception):
+                        await websocket.send_text("Error: " + str(token))
+                    else:
+                        await websocket.send_text(token)
+                except queue.Empty:
+                    await asyncio.sleep(0.1)
+            full_response = "".join(user_data.response_tokens)
+            user_data.conversation_history.append({"role": "assistant", "content": full_response})
     except WebSocketDisconnect:
         print("WebSocket disconnected")
     except Exception as e:
@@ -123,6 +147,12 @@ async def websocket_infer(websocket: WebSocket):
 @app.post("/infer")
 async def infer_endpoint(data: dict):
     prompt = data.get("prompt")
+    messages = [ 
+        {"role": "system", "content": "Eisai o Mastoras, o prosopikos voithos tou Chris. Help him anywhere you can!"},
+        {"role": "user", "content": prompt}
+    ]
+    data["prompt"] = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    
     user_data = UserData()
     thread = threading.Thread(target=blocking_inference, args=(data, user_data))
     thread.start()
